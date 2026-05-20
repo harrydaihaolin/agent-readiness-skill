@@ -1,0 +1,12 @@
+{
+  "name": "agent-readiness-skill",
+  "description": "Agent-readiness skill marketplace — scores how AI-ready a repo is and applies the top fix.",
+  "owner": { "name": "Harry Dai" },
+  "plugins": [
+    {
+      "name": "agent-readiness",
+      "source": "./",
+      "description": "Score how AI-ready a repo is and apply the top fix."
+    }
+  ]
+}

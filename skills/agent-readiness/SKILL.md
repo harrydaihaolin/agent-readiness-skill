@@ -101,51 +101,30 @@ agent) confirm the fix without re-running the whole scanner.
 
 ## Installation
 
-The skill works in Claude (Claude Code, Claude Desktop) and Cursor — both
-consume the same SKILL.md open-standard format.
+This skill ships as a Claude Code plugin, which auto-wires the
+`agent-readiness-mcp` MCP server for you. Users on other harnesses
+install the bare SKILL.md plus a manual MCP config.
 
-### 1. Install the MCP server
+### Claude Code (plugin)
 
-```bash
-pip install agent-readiness-mcp
+```
+/plugin marketplace add harrydaihaolin/agent-readiness-skill
+/plugin install agent-readiness@agent-readiness-skill
 ```
 
-### 2. Drop SKILL.md into your skills directory
+Once installed and `agent-readiness-mcp` is on your `$PATH`
+(`pip install agent-readiness-mcp`), the skill auto-triggers when you
+ask Claude things like "score this repo for agent readiness."
 
-- **Claude**: `~/.claude/skills/agent-readiness/SKILL.md`
-- **Cursor (user-level)**: `~/.cursor/skills/agent-readiness/SKILL.md`
-- **Cursor (project-level)**: `.cursor/skills/agent-readiness/SKILL.md`
+### Cursor / Claude Desktop (bare SKILL.md)
 
-The repo's `scripts/install.sh` does steps 1 and 2 for you and auto-detects
-which harnesses you have:
-
-```bash
-./scripts/install.sh                  # auto-detect
-./scripts/install.sh --target=claude  # force Claude only
-./scripts/install.sh --target=cursor  # force Cursor only
-./scripts/install.sh --target=both    # both, creating dirs if needed
+```
+git clone https://github.com/harrydaihaolin/agent-readiness-skill.git
+cd agent-readiness-skill
+./scripts/install.sh             # auto-detects Cursor / Claude Desktop dirs
 ```
 
-### 3. Wire the MCP server into your harness config
-
-Same JSON payload for both harnesses:
-
-```json
-{
-  "mcpServers": {
-    "agent-readiness": {
-      "command": "agent-readiness-mcp",
-      "args": ["--transport", "stdio"]
-    }
-  }
-}
-```
-
-Paste into:
-
-- **Claude Desktop / Claude Code**: `~/.claude/claude_desktop_config.json`,
-  or run `claude mcp add agent-readiness -- agent-readiness-mcp --transport stdio`.
-- **Cursor (user-level)**: `~/.cursor/mcp.json`.
-- **Cursor (project-level)**: `.cursor/mcp.json` inside the repo.
-
-Restart the harness to pick up the new server.
+The script copies this SKILL.md into the right harness skills directory.
+You still need to paste the MCP server JSON into your harness config
+(`~/.cursor/mcp.json` for Cursor; `~/.claude/claude_desktop_config.json`
+for Claude Desktop). The script prints the exact payload at the end.
