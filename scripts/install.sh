@@ -12,7 +12,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_SRC="$SCRIPT_DIR/../SKILL.md"
+SKILL_SRC="$SCRIPT_DIR/../skills/agent-readiness/SKILL.md"
 
 TARGET="auto"
 for arg in "$@"; do
@@ -27,6 +27,11 @@ Usage: $0 [--target=claude|cursor|both|auto]
   claude:         install only to ~/.claude/skills/agent-readiness/.
   cursor:         install only to ~/.cursor/skills/agent-readiness/.
   both:           install to both (creating dirs if needed).
+
+  Claude Code users should prefer the plugin install:
+    /plugin marketplace add harrydaihaolin/agent-readiness-skill
+    /plugin install agent-readiness@agent-readiness-skill
+  This script remains the canonical path for Cursor and Claude Desktop.
 USAGE
       exit 0
       ;;

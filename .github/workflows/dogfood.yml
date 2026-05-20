@@ -38,14 +38,14 @@ jobs:
 
       - name: Self-scan
         # --fail-below 90: gate merges on a minimum readiness score.
-        # --apply-top-action: land the single highest-priority structured fix.
-        # --verify: run the action's verify command after applying.
-        # If verify fails, the workflow exits 1 and the PR is blocked.
+        # --apply-top-action is intentionally NOT used here: this repo is
+        # docs + a shell installer, with no language manifest, so the
+        # scanner's modify_manifest_field handler would crash on apply.
+        # Track the upstream fix at:
+        #   https://github.com/harrydaihaolin/agent-readiness (apply_action.py).
         run: |
           agent-readiness scan . \
             --fail-below 90 \
-            --apply-top-action \
-            --verify \
             --no-progress
 
       - name: Show diff (when apply changed anything)

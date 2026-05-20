@@ -19,5 +19,36 @@ jobs:
       - name: Frontmatter sanity
         run: |
           # SKILL.md must start with a YAML frontmatter and declare a name
-          head -n 5 SKILL.md | grep -q "^name: agent-readiness$"
-          head -n 5 SKILL.md | grep -q "^---$"
+          head -n 5 skills/agent-readiness/SKILL.md | grep -q "^name: agent-readiness$"
+          head -n 5 skills/agent-readiness/SKILL.md | grep -q "^---$"
+
+  plugin-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.7
+      - name: JSON syntax — plugin manifests
+        # The `claude` CLI isn't trivially installable on hosted runners
+        # right now, so we lint JSON syntax + presence of required keys
+        # rather than running `claude plugin validate`. Revisit when the
+        # CLI ships an `npx`-style runner.
+        run: |
+          python3 -m json.tool < .claude-plugin/plugin.json > /dev/null
+          python3 -m json.tool < .claude-plugin/marketplace.json > /dev/null
+          python3 -m json.tool < .mcp.json > /dev/null
+      - name: Required plugin keys
+        run: |
+          python3 -c "
+          import json, sys
+          for path, required in [
+              ('.claude-plugin/plugin.json', ['name', 'description', 'version']),
+              ('.claude-plugin/marketplace.json', ['name', 'plugins']),
+              ('.mcp.json', ['mcpServers']),
+          ]:
+              with open(path) as f:
+                  data = json.load(f)
+              missing = [k for k in required if k not in data]
+              if missing:
+                  print(f'{path}: missing keys {missing}')
+                  sys.exit(1)
+              print(f'{path}: OK')
+          "
