@@ -1,59 +1,63 @@
 ---
 name: agent-readiness
 description: >-
-  Use this skill to score how AI-ready a code repository (or every repo in
-  a multi-repo workspace) is and to apply the single highest-priority
-  deterministic fix. Useful when the user asks "is this repo agent-ready?",
-  "score this workspace", "what should I add to AGENTS.md?", "fix the top
-  agent-readiness gap", or starts work in an unfamiliar checkout and wants
-  the canonical commands and boundary rules summarised. Always call
-  `detect_workspace` first on the user-supplied path — without that step
-  scoring a parent directory of N sibling repos produces silently garbage
-  numbers. Wraps the agent-readiness-mcp server, which is itself backed by
-  the agent-readiness scanner wheel.
+  Score how agent-ready a code repository or multi-repo workspace is, and
+  apply the single highest-priority deterministic fix. Wraps the
+  agent-readiness-mcp server. Use when the user asks "is this repo
+  agent-ready?", "score this repo / workspace", "what should I add to
+  AGENTS.md?", or "fix the top agent-readiness gap". Always call
+  `enumerate_workspace` first on the user-supplied path — without that
+  step scoring a parent directory of N sibling repos silently produces
+  garbage numbers. The Coordination pillar (workspace-only) measures
+  whether agents can operate coherently across a group of repos.
 ---
 
-The agent-readiness skill scores a repo on four pillars (Cognitive Load,
-Feedback, Flow, Safety) and pins the single highest-priority structured
-fix as the `top_action`. The skill works in three phases:
+# agent-readiness skill
 
-1. **Detect** what kind of path the user handed you (single repo,
-   monorepo, multi-repo workspace). Without this step, scoring a parent
-   directory of N sibling repos silently produces garbage numbers.
-2. **Scan** the right repo (or N repos, with the user's selection if
-   they didn't pre-pick) and read the `top_action` block.
-3. **Apply** the pinned action (`apply_top_action`) and run its verify
-   command. The action is deterministic — there is no LLM in the apply
-   path.
+Score how agent-ready a code repository OR a multi-repo workspace is.
+The skill works in three phases:
+
+1. **Enumerate** — call `enumerate_workspace(path)` first. Always.
+2. **Classify** — read the enumeration (plus 2–3 READMEs if needed) and
+   decide whether `path` is a single repo, a monorepo, a workspace of
+   independents, or not a code repo at all.
+3. **Scan** — route to either `scan_repo(path)` (single repo / monorepo)
+   or `check_workspace_readiness(path, children_paths)` (workspace).
+
+The Coordination pillar (workspace-only) asks whether agents can
+operate coherently across a group of repos — root AGENTS.md present,
+member repos declared, dependency / change order documented. Per the
+agentic-engineering literature (Mabl, Bishoy Labib), dep-graph drift
+is the single most critical failure mode for multi-repo agent work.
 
 ## Workflow
 
-### 1. Always call `detect_workspace` first
+### Phase 1 — Enumerate
 
-Before any scan, classify the user-supplied path:
+Always start with `enumerate_workspace(path)`. Never call `scan_repo`
+first on an unfamiliar path. The enumeration is cheap, static, and
+gives you enough to classify.
 
 ```
-detection = detect_workspace(path="/path/to/something")
-print(detection["classification"])  # single_repo | monorepo | multi_repo_workspace
-print(detection["confidence"])      # high | medium | low
+result = enumerate_workspace(path="/path/to/dir")
 ```
 
-Branch on `classification`:
+The envelope contains `root`, `children[]`, `manifest_signals`, and
+`stats`. Read it all.
 
-- **`single_repo`** — silently proceed to `scan_repo` (no HITL prompt;
-  this is the most common case and the path the user expects).
-- **`monorepo`** — narrate it briefly: *"Monorepo detected (signal:
-  `<detection['signals']['fired'][0]>`). Scanning as one repo."* Then
-  call `scan_repo`. The scanner today scores monorepos as one repo by
-  design; per-package breakdowns are a future feature.
-  - For `confidence: low` (Signal C — scattered manifests), soften it:
-    *"This might be a monorepo (3+ scattered manifests). Treating as a
-    single repo — let me know if you want me to scan a sub-package
-    directly instead."*
-- **`multi_repo_workspace`** — never auto-scan. Narrate the list and
-  ask the user which subset to scan. See the next section.
+### Phase 2 — Classify
 
-### 2a. Single-repo scan
+Apply this rubric in order:
+
+| Signal                                                                                       | Classification                | Next step                                                                                                                              |
+|----------------------------------------------------------------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `root.has_git == false` AND ≥ 2 children with `has_git == true`                              | **workspace of independents** | Read root AGENTS.md (if any) + 2–3 child READMEs to confirm independent vs. coordinated; then `check_workspace_readiness`              |
+| Any `manifest_signals.*` is `true`                                                           | **monorepo**                  | Skip child README reads; call `scan_repo(root)`                                                                                        |
+| `root.has_git == true` AND no children with `.git` AND all signals false                     | **single repo**               | `scan_repo(root)`                                                                                                                      |
+| Root has neither `.git` nor `README.md` AND enumeration returned zero children               | **not a code repo**           | Tell the user, exit                                                                                                                    |
+| Anything else                                                                                | **ambiguous**                 | Read root + 2–3 child READMEs via the Read tool; ask the user if still unclear                                                         |
+
+### Phase 3a — Scan a single repo / monorepo
 
 ```
 result = scan_repo(path="/path/to/repo")
@@ -61,160 +65,73 @@ print(result["overall_score"])
 print(result["top_action"])
 ```
 
-The `overall_score` is on a 0-100 scale; treat anything below 90 as
-"ship a fix" and below 60 as "this repo isn't agent-ready yet, expect
-the apply loop to iterate."
+The `top_action` block contains `action` (a structured edit) and
+`verify` (a one-line shell command).
 
-The `top_action` payload contains:
-
-- `check_id`, `pillar`, `severity`, `weight`, `rationale` — why this
-  finding wins the pin
-- `action` — the structured edit (`kind`: create_file / append_to_file /
-  edit_gitignore / insert_after / modify_manifest_field / run_command /
-  multi_step)
-- `verify` — a one-line shell command that confirms the fix landed
-- optional `fix_hint` — human-readable prose for cases where the
-  structured action isn't enough on its own
-
-### 2b. Multi-repo workspace selection
-
-Narrate the detected repos with their AGENTS.md descriptions (if
-present), then ask the user which to scan. Example narration when the
-detector returns 3 repos with display names:
-
-> I see this is a multi-repo workspace (confidence: high) with 3
-> sibling repos:
->
-> 1. `alpha-svc` — Alpha HTTP service.
-> 2. `beta-lib` — Beta shared library.
-> 3. `gamma-cli` — Gamma command-line client.
->
-> Scan all three, or just a subset?
-
-If the user says "all," call `scan_workspace(path, select=None)`. If
-they pick a subset, pass `select=["alpha-svc", "gamma-cli"]`. Names
-must match the `name` field from `detect_workspace`'s `repos` array
-exactly; the tool surfaces unknown names in `skipped` with
-`reason="not detected"`, which you should re-raise as a clean error
-to the user instead of silently proceeding.
-
-If the detection returned **drift warnings** (the user's `AGENTS.md`
-mentions a repo that isn't checked out, or a checked-out repo isn't
-listed in `AGENTS.md`), surface them at the end of the narration as a
-"by the way" — they're a free maintenance signal, not a hard error:
-
-> By the way: `AGENTS.md` mentions `./delta-not-checked-out` but
-> there's no `.git` for it on disk. Probably worth either checking it
-> out or updating `AGENTS.md`.
-
-The result of `scan_workspace` is a single envelope with a `scanned`
-list (one entry per repo, each containing a full `ReadinessReport`
-under `report`) and a `skipped` list. Iterate the `scanned` entries
-when narrating per-repo summaries to the user.
-
-### `scan_repo` on a multi-repo workspace
-
-If the user (or you, by mistake) calls `scan_repo` on a workspace
-root, the tool returns a structured `error` payload instead of a
-report:
+### Phase 3b — Scan a workspace
 
 ```
-{
-  "error": "multi_repo_workspace",
-  "hint": "this path contains multiple repos; call detect_workspace(path) to list them or scan_workspace(path, select=[...]) to scan a subset",
-  "detected_repos": ["alpha-svc", "beta-lib", "gamma-cli"],
-  "root": "...",
-  "version": "detect_v1"
-}
+result = check_workspace_readiness(
+    path="/path/to/workspace",
+    children_paths=[<paths Claude classified as workspace members>],
+)
 ```
 
-Treat this as a "switch tools" signal — don't try to apologise to the
-user about the missing report; just chain through to
-`scan_workspace` (or back to `detect_workspace` if the user needs to
-pick) without ceremony.
+The envelope contains 5 pillars (Cognitive Load, Feedback, Flow,
+Safety — aggregated from children; Coordination — workspace-only),
+per-child cards sorted worst-first, and a single `top_action` whose
+`scope` is `"workspace"` (a Coordination fix) or `"child"` (the worst
+child's top_action with `child_path` stamped on).
 
-### 3. Apply the fix
+Present:
 
-When the user asks "fix the top issue" or "make this agent-ready," call
-`apply_top_action(path, run_verify=True)`. The tool:
+- One-line workspace overall score + 5 pillar scores.
+- Children sorted worst-first, each with overall score + safety cap if any.
+- The `top_action` with its `scope` called out.
+- The verify command, so the user can confirm the fix.
 
-- refuses to overwrite existing files unless the action's
-  `preconditions` explicitly allow it
-- runs the verify command after applying and reports whether it passed
-- never commits, never opens a PR — that's the human's call
+## Apply contract
 
-Read the returned envelope:
+`apply_top_action` covers `create_file`, `append_to_file`, and the
+other structured action kinds. `run_command` actions are surfaced for
+the user to execute manually — the skill never runs them. This is
+intentional: it closes the footgun where a `git init && git add -A`
+recipe would have been auto-executed against a workspace and produced
+broken gitlinks.
 
-- `applied: true` + `verified: true` → tell the user the fix landed and
-  what file you wrote
-- `applied: true` + `verified: false` → report the verify stderr; the
-  fix may still be correct but the verify command is too strict
-- `applied: false` → read `skipped_reason`; usually a precondition the
-  user can satisfy, or a `run_command` action whose contract is "I tell
-  you the command, you run it"
+## Anti-patterns
 
-### 4. Iterate
-
-For repos starting below 90, expect 2-5 apply loops. After each apply,
-re-scan; the top_action will rotate to the next-highest-priority fix.
-On a multi-repo workspace, iterate per repo — don't try to apply a
-single top_action across multiple sibling repos.
+- **Never call `scan_repo` on a path you haven't enumerated**, unless
+  the user explicitly named the path and it passes a quick `.git/`
+  check.
+- **Never call `check_workspace_readiness` with an empty
+  `children_paths`** — the tool will refuse, and rightly so. Classify
+  first.
+- **Never auto-run `run_command` actions.** Surface them; let the user
+  execute.
 
 ## When NOT to use this skill
 
-- The user wants you to write code that uses the agent-readiness library
-  (use the docstrings, not this skill).
-- The repo is brand-new (< 24h old, 0 commits beyond the initial). Many
-  rules are not informative on a one-commit repo; suggest the user run
-  `agent-readiness gen agents-md` first to seed the canonical files.
+- The user wants you to write code that uses the agent-readiness
+  library (use the docstrings, not this skill).
+- The repo is brand-new (< 24h old, 0 commits beyond the initial). The
+  Coordination checks won't fire usefully on an empty workspace.
 
-## Output format
+## Worked example (the dogfood case)
 
-When showing the user a scan result, prefer:
+User invokes the skill on `agent-readiness_project/`.
 
-```
-Score: 72.5 / 100 (band: silver)
-
-Pillar breakdown:
-  Cognitive Load: 80
-  Feedback: 65
-  Flow: 70
-  Safety: 90 (no cap applied)
-
-Top action (Phase: feedback)
-  Add a CI workflow that runs the test suite.
-  Verify: rg -q -e 'on:|jobs:' .github/workflows/ 2>/dev/null
-```
-
-Always surface the verify command — it lets the user (or the next
-agent) confirm the fix without re-running the whole scanner.
-
-## Installation
-
-This skill ships as a Claude Code plugin, which auto-wires the
-`agent-readiness-mcp` MCP server for you. Users on other harnesses
-install the bare SKILL.md plus a manual MCP config.
-
-### Claude Code (plugin)
-
-```
-/plugin marketplace add harrydaihaolin/agent-readiness-skill
-/plugin install agent-readiness@agent-readiness-skill
-```
-
-Once installed and `agent-readiness-mcp` is on your `$PATH`
-(`pip install agent-readiness-mcp`), the skill auto-triggers when you
-ask Claude things like "score this repo for agent readiness."
-
-### Cursor / Claude Desktop (bare SKILL.md)
-
-```
-git clone https://github.com/harrydaihaolin/agent-readiness-skill.git
-cd agent-readiness-skill
-./scripts/install.sh             # auto-detects Cursor / Claude Desktop dirs
-```
-
-The script copies this SKILL.md into the right harness skills directory.
-You still need to paste the MCP server JSON into your harness config
-(`~/.cursor/mcp.json` for Cursor; `~/.claude/claude_desktop_config.json`
-for Claude Desktop). The script prints the exact payload at the end.
+1. `enumerate_workspace("agent-readiness_project")` returns:
+   - `root.has_git: false`, `root.has_agents_md: true`
+   - 17 children, all with `has_git: true`
+   - All `manifest_signals` false
+2. Rubric → **workspace of independents**.
+3. Read root AGENTS.md (confirms portfolio context). Spot-check 2 child READMEs.
+4. `check_workspace_readiness("agent-readiness_project", [<17 child paths>])`.
+5. Returns: 5-pillar envelope. If Coordination fires (root AGENTS.md
+   present but no `## Repos in this workspace` section, no dep graph
+   documented) the top_action is `scope="workspace"`,
+   `check_id="coordination.dep_graph"`, with a structured
+   `append_to_file` action targeting root AGENTS.md.
+6. Skill presents the report. User reviews, optionally calls
+   `apply_top_action`.
