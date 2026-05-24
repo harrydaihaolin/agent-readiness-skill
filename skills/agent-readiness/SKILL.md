@@ -51,7 +51,7 @@ Apply this rubric in order:
 
 | Signal                                                                                       | Classification                | Next step                                                                                                                              |
 |----------------------------------------------------------------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| `root.has_git == false` AND ≥ 2 children with `has_git == true`                              | **workspace of independents** | Read root AGENTS.md (if any) + 2–3 child READMEs to confirm independent vs. coordinated; then `check_workspace_readiness`              |
+| `root.has_git == false` AND ≥ 2 children with `has_git == true`                              | **workspace of independents** | Read root AGENTS.md (if any) + 2–3 child READMEs to confirm independent vs. coordinated; check whether `ontology/` exists at the workspace root — if not, **offer** the bootstrap loop (see below); then `check_workspace_readiness` |
 | Any `manifest_signals.*` is `true`                                                           | **monorepo**                  | Skip child README reads; call `scan_repo(root)`                                                                                        |
 | `root.has_git == true` AND no children with `.git` AND all signals false                     | **single repo**               | `scan_repo(root)`                                                                                                                      |
 | Root has neither `.git` nor `README.md` AND enumeration returned zero children               | **not a code repo**           | Tell the user, exit                                                                                                                    |
@@ -89,6 +89,112 @@ Present:
 - Children sorted worst-first, each with overall score + safety cap if any.
 - The `top_action` with its `scope` called out.
 - The verify command, so the user can confirm the fix.
+
+## Bootstrap an ontology
+
+Use this when the user asks to **bootstrap an ontology**, **set up an ontology**,
+or when you are about to score a workspace and **no `ontology/` directory**
+exists at the workspace root. Ontology bootstrap is optional — offer it for
+workspace-of-independents paths, never force it.
+
+All bootstrap tools are reached via the **`ontology` passthrough** on
+`agent-readiness-mcp`:
+
+```
+ontology(subcmd="<tool_name>", arguments={...})
+```
+
+### Propose / ratify lifecycle
+
+Every atom carries `lifecycle: {state: proposed | ratified, …}`. Bootstrap
+tools **propose** atoms; a human must **ratify** each accepted atom via CLI.
+Re-bootstrap is **additive only** — ratified atoms are never overwritten.
+
+**Ratification is human-gated by default.** Do not auto-ratify unless the
+user explicitly opts in.
+
+After each ratification batch, run the closure invariant:
+
+```bash
+agent-readiness ontology validate ontology/ --strict
+```
+
+Ratified atoms must not reference unratified atoms.
+
+### Bootstrap loop (6 steps)
+
+1. **`bootstrap_init`** — scaffold the starter ontology skeleton.
+
+   ```
+   ontology(subcmd="bootstrap_init", arguments={"path": "/abs/path", "profile": "workspace"})
+   ```
+
+   Profiles: `workspace` (default), `single-repo`, `monorepo`.
+
+2. **Object instances** — propose Repos, then repeat for each Object Type.
+
+   ```
+   ontology(subcmd="bootstrap_propose_object_instances", arguments={"path": "/abs/path", "object_type": "Repo"})
+   ```
+
+   Repeat for `Library`, `Protocol`, `RulesPack`.
+
+   **Human gate:** present `proposed` and `ambiguities` from the envelope.
+   Resolve any `???` markers with the user. For each accepted atom:
+
+   ```bash
+   agent-readiness ontology ratify --atom <id> --ratified-by <handle>
+   ```
+
+3. **Link instances** — after ≥ 80% of Repo instances are ratified, propose
+   links for each Link Type:
+
+   ```
+   ontology(subcmd="bootstrap_propose_link_instances", arguments={"path": "/abs/path", "link_type": "dependsOn"})
+   ```
+
+   Repeat for: `partOf`, `ownedBy`, `vendors`, `providesProtocol`,
+   `consumesProtocol`, `deploysTo`, `releasedAs`. Same ratify cadence as step 2.
+
+4. **Interface claims** — evaluate satisfaction proofs for each declared
+   Interface:
+
+   ```
+   ontology(subcmd="bootstrap_propose_interface_claims", arguments={"path": "/abs/path", "interface": "Releasable"})
+   ```
+
+   Repeat for: `Headless`, `Versioned`, `Scannable`, `Documented`, `Tested`.
+
+5. **Function implementations** — generate Python stubs for declared Functions:
+
+   ```
+   ontology(subcmd="bootstrap_propose_function_implementations", arguments={"path": "/abs/path", "function_type": "compute_dep_graph"})
+   ```
+
+   Repeat for: `compute_publish_order`, `compute_change_impact`.
+
+6. **Action / Intent types** — detect Actions from CI workflows and emit Intent
+   templates:
+
+   ```
+   ontology(subcmd="bootstrap_propose_action_intent_types", arguments={"path": "/abs/path", "scope": "all"})
+   ```
+
+   Scope values: `all` (default), `single_system`, `cross_repo`.
+
+### Example: user says "bootstrap an ontology for this workspace"
+
+```
+1. ontology(subcmd="bootstrap_init", arguments={"path": "/abs/path", "profile": "workspace"})
+   → confirm files_written ≥ 25, present to user.
+
+2. ontology(subcmd="bootstrap_propose_object_instances", arguments={"path": "/abs/path", "object_type": "Repo"})
+   → present envelope.proposed and envelope.ambiguities to user. Each proposed atom
+     shows lifecycle.confidence and any `???` markers.
+
+3. For each accepted Repo: agent-readiness ontology ratify --atom <repo_id> --ratified-by <user>.
+   Then validate: agent-readiness ontology validate ontology/ --strict.
+```
 
 ## Apply contract
 
