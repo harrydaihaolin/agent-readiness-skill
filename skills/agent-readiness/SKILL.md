@@ -25,10 +25,15 @@ The skill works in three phases:
 2. **Classify** — read the enumeration (plus 2–3 READMEs if needed) and
    decide whether `path` is a single repo, a monorepo, a workspace of
    independents, or not a code repo at all.
-3. **Scan** — route to either `scan_repo(path)` (single repo / monorepo),
-   `check_workspace_readiness(path, children_paths)` (workspace, in
-   chat mode), or `scan_workspace_async(path, children_paths)`
-   (workspace, in dashboard mode).
+3. **Scan** — route to one of three tools by classification:
+   - single repo / monorepo → `scan_repo(path)` (chat mode, seconds).
+   - **workspace (≥ 2 repos) → `scan_workspace_async(path, children_paths)`
+     (dashboard mode, returns in ~2s with a `dashboard_url`).** This is
+     the default. The chat is NOT blocked.
+   - workspace, headless / explicit opt-out only →
+     `check_workspace_readiness(path, children_paths)` (synchronous,
+     blocks the chat for ~30s per repo). Reserved for CI or when the
+     user said "don't open the dashboard".
 
 The Coordination pillar (workspace-only) asks whether agents can
 operate coherently across a group of repos — root AGENTS.md present,
@@ -84,7 +89,7 @@ Apply this rubric in order:
 
 | Signal                                                                                       | Classification                | Next step                                                                                                                              |
 |----------------------------------------------------------------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| `root.has_git == false` AND ≥ 2 children with `has_git == true`                              | **workspace of independents** | Read root AGENTS.md (if any) + 2–3 child READMEs to confirm independent vs. coordinated; check whether `ontology/` exists at the workspace root — if not, **offer** the bootstrap loop (see below); then `check_workspace_readiness` |
+| `root.has_git == false` AND ≥ 2 children with `has_git == true`                              | **workspace of independents** | Read root AGENTS.md (if any) + 2–3 child READMEs to confirm independent vs. coordinated; check whether `ontology/` exists at the workspace root — if not, **offer** the bootstrap loop (see below); then **`scan_workspace_async`** (dashboard mode, default). Only fall back to `check_workspace_readiness` if the user explicitly opted out of the dashboard. |
 | Any `manifest_signals.*` is `true`                                                           | **monorepo**                  | Skip child README reads; call `scan_repo(root)`                                                                                        |
 | `root.has_git == true` AND no children with `.git` AND all signals false                     | **single repo**               | `scan_repo(root)`                                                                                                                      |
 | Root has neither `.git` nor `README.md` AND enumeration returned zero children               | **not a code repo**           | Tell the user, exit                                                                                                                    |
@@ -101,38 +106,13 @@ print(result["top_action"])
 The `top_action` block contains `action` (a structured edit) and
 `verify` (a one-line shell command).
 
-### Phase 3b — Chat mode — workspace (fallback)
+### Phase 3b — Dashboard mode — workspace (DEFAULT)
 
-Use `check_workspace_readiness` only when **the user explicitly opted
-out of dashboard mode**. Otherwise prefer Phase 3c (dashboard mode),
-which is the default for multi-repo workspaces.
-
-```
-result = check_workspace_readiness(
-    path="/path/to/workspace",
-    children_paths=[<paths Claude classified as workspace members>],
-)
-```
-
-The envelope contains 5 pillars (Cognitive Load, Feedback, Flow,
-Safety — aggregated from children; Coordination — workspace-only),
-per-child cards sorted worst-first, and a single `top_action` whose
-`scope` is `"workspace"` (a Coordination fix) or `"child"` (the worst
-child's top_action with `child_path` stamped on).
-
-Present:
-
-- One-line workspace overall score + 5 pillar scores.
-- Children sorted worst-first, each with overall score + safety cap if any.
-- The `top_action` with its `scope` called out.
-- The verify command, so the user can confirm the fix.
-
-### Phase 3c — Dashboard mode — workspace (default)
-
-Use this for any multi-repo workspace, monorepo with many sub-repos,
-or any path where you'd otherwise block the chat for >30s waiting on
-sequential scans. The dashboard surfaces per-repo progress live and
-lets the user answer interactive prompts inline.
+**This is the path you take for every multi-repo workspace** unless
+the user explicitly opted out (see Phase 3c). The MCP tool to call
+is `scan_workspace_async` — it returns in ~2 seconds with a
+`dashboard_url`. The chat is NOT blocked. Per-repo progress and
+interactive prompts stream to the dashboard in the user's browser.
 
 ```
 session = scan_workspace_async(
@@ -142,19 +122,27 @@ session = scan_workspace_async(
 # session contains: scan_id, dashboard_url, sse_url, snapshot_url
 ```
 
-Then **tell the user where the dashboard is**:
+Then **tell the user where the dashboard is** in your very next
+response and then stop calling tools:
 
-- Print `session["dashboard_url"]` so they can open it in a browser.
-  The bundled scan-and-view server hosts the SPA at
-  `http://localhost:<port>/live/<scan_id>` (the URL above already
-  points at it).
+- Print `session["dashboard_url"]` verbatim so they can open it in a
+  browser. The URL ends in `/#/live/<scan_id>` — that hash fragment is
+  required; the bare base URL loads the legacy workspace browser
+  instead of the live page.
 - Tell them they can **exit dashboard mode anytime** by typing
   `/agent-readiness exit-dashboard` here in the chat OR by clicking
   the "Exit dashboard mode" button in the browser. Either channel
   returns control to chat mode without killing the scan.
-- Hand off — do NOT block the chat tailing the SSE stream. The skill
-  bridge is **hands-off** by design (see spec § 4): you only check
-  status when the user types in chat.
+- Hand off — do NOT block the chat tailing the SSE stream and do NOT
+  poll `get_scan_status` in a loop. The skill bridge is **hands-off**
+  by design (see spec § 4): you only check status when the user types
+  in chat.
+
+> Critical: do not call `check_workspace_readiness` in this branch.
+> That tool is synchronous and will block the chat for ~30s per child
+> — for a 17-repo workspace, that's 5+ minutes of dead chat where the
+> user can't see what's happening. The dashboard exists specifically
+> to avoid this experience.
 
 #### Status polling during dashboard mode
 
@@ -201,6 +189,32 @@ curl -X POST -H "Content-Type: application/json" \
 
 The scan keeps running. Tell the user the dashboard tab is still
 useful for watching progress; chat mode is back.
+
+### Phase 3c — Chat mode — workspace (opt-out only)
+
+Use `check_workspace_readiness` only when **the user explicitly opted
+out of dashboard mode** (e.g. "don't open the dashboard, just give me
+the JSON" or a headless CI context). Otherwise stay in Phase 3b.
+
+```
+result = check_workspace_readiness(
+    path="/path/to/workspace",
+    children_paths=[<paths Claude classified as workspace members>],
+)
+```
+
+The envelope contains 5 pillars (Cognitive Load, Feedback, Flow,
+Safety — aggregated from children; Coordination — workspace-only),
+per-child cards sorted worst-first, and a single `top_action` whose
+`scope` is `"workspace"` (a Coordination fix) or `"child"` (the worst
+child's top_action with `child_path` stamped on).
+
+Present:
+
+- One-line workspace overall score + 5 pillar scores.
+- Children sorted worst-first, each with overall score + safety cap if any.
+- The `top_action` with its `scope` called out.
+- The verify command, so the user can confirm the fix.
 
 ## Bootstrap an ontology
 
@@ -322,9 +336,20 @@ broken gitlinks.
 - **Never call `scan_repo` on a path you haven't enumerated**, unless
   the user explicitly named the path and it passes a quick `.git/`
   check.
+- **Never call `check_workspace_readiness` on a multi-repo workspace
+  without explicit opt-out.** It is synchronous — for a 17-repo
+  workspace, that is 5+ minutes of blocked chat. The default for any
+  workspace is `scan_workspace_async` (dashboard mode). The only
+  legitimate uses of `check_workspace_readiness` are: (a) the user
+  said "don't open the dashboard / just give me the JSON", (b) you
+  are running headless in CI, or (c) the workspace has 1-2 children.
 - **Never call `check_workspace_readiness` with an empty
   `children_paths`** — the tool will refuse, and rightly so. Classify
   first.
+- **Never poll `get_scan_status` in a loop.** The dashboard already
+  shows live progress over SSE. The skill bridge is hands-off — at
+  most one `get_scan_status` call per chat turn, and only when the
+  user types in chat.
 - **Never auto-run `run_command` actions.** Surface them; let the user
   execute.
 
@@ -337,7 +362,8 @@ broken gitlinks.
 
 ## Worked example (the dogfood case)
 
-User invokes the skill on `agent-readiness_project/`.
+User invokes the skill on `agent-readiness_project/` — a 17-repo
+workspace.
 
 1. `enumerate_workspace("agent-readiness_project")` returns:
    - `root.has_git: false`, `root.has_agents_md: true`
@@ -345,11 +371,35 @@ User invokes the skill on `agent-readiness_project/`.
    - All `manifest_signals` false
 2. Rubric → **workspace of independents**.
 3. Read root AGENTS.md (confirms portfolio context). Spot-check 2 child READMEs.
-4. `check_workspace_readiness("agent-readiness_project", [<17 child paths>])`.
-5. Returns: 5-pillar envelope. If Coordination fires (root AGENTS.md
-   present but no `## Repos in this workspace` section, no dep graph
-   documented) the top_action is `scope="workspace"`,
-   `check_id="coordination.dep_graph"`, with a structured
-   `append_to_file` action targeting root AGENTS.md.
-6. Skill presents the report. User reviews, optionally calls
-   `apply_top_action`.
+4. Pick the right scan tool. The classification is *workspace of
+   independents*, so this is **Phase 3b — dashboard mode (default)**.
+   Call `scan_workspace_async`, NOT `check_workspace_readiness`:
+
+   ```
+   session = scan_workspace_async(
+       path="agent-readiness_project",
+       children_paths=[<17 child paths>],
+   )
+   ```
+
+   Returns in ~2 seconds with `session["dashboard_url"]` (e.g.
+   `http://127.0.0.1:48217/#/live/<scan_id>`).
+5. In your next response: print `dashboard_url` verbatim, tell the
+   user they can answer prompts in the browser and exit dashboard
+   mode anytime (browser button or `/agent-readiness exit-dashboard`
+   in chat). Then **stop calling tools and yield to the user**.
+6. Per-repo scans run in parallel; findings stream to the dashboard
+   over SSE. The user watches progress, answers any clarifying
+   prompts inline, and asks follow-up questions in chat when ready.
+7. When the user asks "how's it going?" or "is it done yet?", call
+   `get_scan_status(session["scan_id"])` **once**, summarise the
+   envelope conversationally (X of Y repos done, score if completed),
+   and yield back. Do not loop.
+8. When `status == "completed"`, present the overall score, the 5
+   pillar scores, the worst children, and the `top_action`. Offer
+   `apply_top_action` if the user wants to land the structured fix.
+
+(For the rare CI / headless case where the user opts out of the
+dashboard, Phase 3c uses `check_workspace_readiness` and reports
+the same envelope synchronously — at the cost of ~5+ minutes of
+blocked chat for this 17-repo workspace.)
