@@ -6,14 +6,17 @@ description: >-
   agent-readiness-mcp server. Use when the user asks "is this repo
   agent-ready?", "score this repo / workspace", "what should I add to
   AGENTS.md?", or "fix the top agent-readiness gap". Always call
-  `enumerate_workspace` first on the user-supplied path — without that
-  step scoring a parent directory of N sibling repos silently produces
-  garbage numbers. The Coordination pillar (workspace-only) measures
-  whether agents can operate coherently across a group of repos. The
-  skill operates in two modes: **chat mode** for single repos /
-  monorepos and **dashboard mode** for multi-repo workspaces, where
-  per-repo scans stream live to a browser dashboard and interactive
-  prompts are answered inline instead of blocking the chat.
+  `enumerate_workspace` first on the user-supplied path; obey the
+  returned `classification_hint.recommended_action` verbatim — do
+  not re-classify or deliberate (with agent-readiness 3.4.3+ the
+  scanner returns a deterministic classification with `scan_repo` /
+  `scan_workspace_async` / `ask_user` / `exit` routing). The skill
+  operates in two modes: **chat mode** for single repos / monorepos
+  and **dashboard mode** for multi-repo workspaces, where per-repo
+  scans stream live to a browser dashboard and interactive prompts
+  are answered inline instead of blocking the chat. The Coordination
+  pillar (workspace-only) measures whether agents can operate
+  coherently across a group of repos.
 ---
 
 # agent-readiness skill
@@ -74,26 +77,79 @@ The scan is the same scan in either mode; only the surface changes.
 
 Always start with `enumerate_workspace(path)`. Never call `scan_repo`
 first on an unfamiliar path. The enumeration is cheap, static, and
-gives you enough to classify.
+gives you a deterministic classification.
 
 ```
 result = enumerate_workspace(path="/path/to/dir")
 ```
 
-The envelope contains `root`, `children[]`, `manifest_signals`, and
-`stats`. Read it all.
+The envelope contains `root`, `children[]`, `manifest_signals`,
+`stats`, **and `classification_hint`** (added in
+agent-readiness 3.4.3 — schema 2).
 
-### Phase 2 — Classify
+### Phase 2 — Read `classification_hint` and obey it
 
-Apply this rubric in order:
+The scanner has already classified the path. Read
+`result["classification_hint"]["recommended_action"]` and act
+verbatim. **Do not re-classify. Do not deliberate. Do not read
+READMEs first.** The hint is a pure function of the signals — LLM
+judgment cannot improve on it and burns wall-clock chat time.
+
+| `recommended_action`        | What to do                                                                 |
+|-----------------------------|----------------------------------------------------------------------------|
+| `"scan_repo"`               | Go to Phase 3a (chat-mode single repo / monorepo).                         |
+| `"scan_workspace_async"`    | Go to Phase 3b (dashboard mode — default for any multi-repo workspace).    |
+| `"ask_user"`                | **STOP. Go to Phase 2.5 below.** Do not scan.                              |
+| `"exit"`                    | Tell the user "this is not a code repo", exit.                             |
+
+The hint also carries `classification` (`single_repo` / `monorepo` /
+`workspace_of_independents` / `ambiguous` / `not_a_code_repo`),
+`confidence` (`high` / `low` / `ambiguous`), and a one-line
+`rationale` that names the signals that fired. Quote the rationale
+back at the user in your first-turn response — it explains *why* you
+chose the scan path you chose.
+
+#### Phase 2.5 — When `recommended_action == "ask_user"`
+
+The signals are ambiguous from data alone (e.g. root has `.git` AND
+children also have `.git` — could be a workspace nested in a
+meta-repo, a monorepo with submodules, or a single repo with
+unrelated sub-checkouts). The scanner already pre-rendered the
+disambiguation prompt for you. Paint it into chat verbatim:
+
+```text
+{result["classification_hint"]["ambiguity_reason"]}
+
+Which best describes this path?
+
+(a) {ambiguity_options[0]["label"]} — {ambiguity_options[0]["hint"]}
+(b) {ambiguity_options[1]["label"]} — {ambiguity_options[1]["hint"]}
+(c) {ambiguity_options[2]["label"]} — {ambiguity_options[2]["hint"]}
+```
+
+Wait for the user to pick. Then chain the option's `route` field:
+
+- `route == "scan_repo"` → Phase 3a.
+- `route == "scan_workspace_async"` → Phase 3b.
+- `route == "exit"` → tell the user, stop.
+
+Do NOT improvise alternate wording, do NOT read READMEs to "double
+check" — the README will not resolve a workspace-vs-monorepo question
+because both layouts have READMEs. The user is the only oracle.
+
+#### Phase 2 — Fallback (for agent-readiness < 3.4.3)
+
+If `classification_hint` is missing from the envelope (you're talking
+to an older scanner), fall back to the manual rubric below. For new
+installs this branch is dead code.
 
 | Signal                                                                                       | Classification                | Next step                                                                                                                              |
 |----------------------------------------------------------------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| `root.has_git == false` AND ≥ 2 children with `has_git == true`                              | **workspace of independents** | Read root AGENTS.md (if any) + 2–3 child READMEs to confirm independent vs. coordinated; check whether `ontology/` exists at the workspace root — if not, **offer** the bootstrap loop (see below); then **`scan_workspace_async`** (dashboard mode, default). Only fall back to `check_workspace_readiness` if the user explicitly opted out of the dashboard. |
-| Any `manifest_signals.*` is `true`                                                           | **monorepo**                  | Skip child README reads; call `scan_repo(root)`                                                                                        |
-| `root.has_git == true` AND no children with `.git` AND all signals false                     | **single repo**               | `scan_repo(root)`                                                                                                                      |
-| Root has neither `.git` nor `README.md` AND enumeration returned zero children               | **not a code repo**           | Tell the user, exit                                                                                                                    |
-| Anything else                                                                                | **ambiguous**                 | Read root + 2–3 child READMEs via the Read tool; ask the user if still unclear                                                         |
+| `root.has_git == false` AND ≥ 2 children with `has_git == true`                              | **workspace of independents** | Phase 3b (dashboard mode).                                                                                                              |
+| Any `manifest_signals.*` is `true`                                                           | **monorepo**                  | Phase 3a, call `scan_repo(root)`.                                                                                                       |
+| `root.has_git == true` AND no children with `.git` AND all signals false                     | **single repo**               | Phase 3a, call `scan_repo(root)`.                                                                                                       |
+| Root has neither `.git` nor `README.md` AND enumeration returned zero children               | **not a code repo**           | Tell the user, exit.                                                                                                                    |
+| Anything else                                                                                | **ambiguous**                 | Run Phase 2.5 — ask the user, do NOT read READMEs first.                                                                                |
 
 ### Phase 3a — Chat mode — single repo / monorepo
 
@@ -333,6 +389,11 @@ broken gitlinks.
 
 ## Anti-patterns
 
+- **Never re-classify in your head when `classification_hint` is
+  present.** Read `recommended_action` and obey. Deliberating wastes
+  wall-clock chat time and the LLM gets ambiguous cases wrong
+  (workspaces that happen to also have a meta-`.git` get called
+  "monorepo low confidence" and scanned wrong).
 - **Never call `scan_repo` on a path you haven't enumerated**, unless
   the user explicitly named the path and it passes a quick `.git/`
   check.
@@ -350,6 +411,10 @@ broken gitlinks.
   shows live progress over SSE. The skill bridge is hands-off — at
   most one `get_scan_status` call per chat turn, and only when the
   user types in chat.
+- **When `recommended_action == "ask_user"`, never read READMEs to
+  "double check" before asking.** The README will not resolve a
+  workspace-vs-monorepo question because both layouts have READMEs.
+  Ask the user immediately with the pre-rendered options.
 - **Never auto-run `run_command` actions.** Surface them; let the user
   execute.
 
@@ -360,20 +425,26 @@ broken gitlinks.
 - The repo is brand-new (< 24h old, 0 commits beyond the initial). The
   Coordination checks won't fire usefully on an empty workspace.
 
-## Worked example (the dogfood case)
+## Worked example A — the clean dogfood case
 
 User invokes the skill on `agent-readiness_project/` — a 17-repo
-workspace.
+workspace, root has no `.git`.
 
-1. `enumerate_workspace("agent-readiness_project")` returns:
-   - `root.has_git: false`, `root.has_agents_md: true`
-   - 17 children, all with `has_git: true`
-   - All `manifest_signals` false
-2. Rubric → **workspace of independents**.
-3. Read root AGENTS.md (confirms portfolio context). Spot-check 2 child READMEs.
-4. Pick the right scan tool. The classification is *workspace of
-   independents*, so this is **Phase 3b — dashboard mode (default)**.
-   Call `scan_workspace_async`, NOT `check_workspace_readiness`:
+1. `enumerate_workspace("agent-readiness_project")` returns a
+   `classification_hint` block:
+
+   ```json
+   {
+     "classification": "workspace_of_independents",
+     "confidence": "high",
+     "recommended_action": "scan_workspace_async",
+     "rationale": "root has no .git AND 17 children have .git — classic workspace-of-independents layout"
+   }
+   ```
+
+2. **Obey the hint.** `recommended_action == "scan_workspace_async"`
+   → Phase 3b (dashboard mode). No re-classification, no README
+   reads.
 
    ```
    session = scan_workspace_async(
@@ -384,22 +455,72 @@ workspace.
 
    Returns in ~2 seconds with `session["dashboard_url"]` (e.g.
    `http://127.0.0.1:48217/#/live/<scan_id>`).
-5. In your next response: print `dashboard_url` verbatim, tell the
-   user they can answer prompts in the browser and exit dashboard
-   mode anytime (browser button or `/agent-readiness exit-dashboard`
-   in chat). Then **stop calling tools and yield to the user**.
-6. Per-repo scans run in parallel; findings stream to the dashboard
+
+3. In your next response: quote the `rationale` so the user knows
+   *why*, print `dashboard_url` verbatim, tell them they can answer
+   prompts in the browser and exit dashboard mode anytime (browser
+   button or `/agent-readiness exit-dashboard` in chat). Then
+   **stop calling tools and yield to the user**.
+
+4. Per-repo scans run in parallel; findings stream to the dashboard
    over SSE. The user watches progress, answers any clarifying
    prompts inline, and asks follow-up questions in chat when ready.
-7. When the user asks "how's it going?" or "is it done yet?", call
+
+5. When the user asks "how's it going?" or "is it done yet?", call
    `get_scan_status(session["scan_id"])` **once**, summarise the
    envelope conversationally (X of Y repos done, score if completed),
    and yield back. Do not loop.
-8. When `status == "completed"`, present the overall score, the 5
+
+6. When `status == "completed"`, present the overall score, the 5
    pillar scores, the worst children, and the `top_action`. Offer
    `apply_top_action` if the user wants to land the structured fix.
 
+## Worked example B — the ambiguous case (root + children both have `.git`)
+
+User invokes the skill on `agent-readiness_project/` after they ran
+`git init` at the root to track a top-level `AGENTS.md`. Now the root
+*also* has `.git`.
+
+1. `enumerate_workspace(...)` returns:
+
+   ```json
+   {
+     "classification": "ambiguous",
+     "confidence": "ambiguous",
+     "recommended_action": "ask_user",
+     "rationale": "root has .git AND 17 children also have .git",
+     "ambiguity_reason": "Root has a .git directory AND one or more children also have .git. This could be (a) a workspace of independent repos that someone put under its own meta-repo, (b) a monorepo where the nested .git dirs are submodules / vendored checkouts, or (c) a single repo whose subdirs happen to be unrelated git checkouts. The signals cannot tell these apart — only you can.",
+     "ambiguity_options": [
+       {"id": "workspace", "label": "Workspace of independent repos", "route": "scan_workspace_async", "hint": "Each child is its own git repo with its own remote and release cycle. Launch the live dashboard."},
+       {"id": "monorepo", "label": "Monorepo", "route": "scan_repo", "hint": "One coherent project; the nested .git directories are submodules / vendored checkouts. Scan the root as one repo."},
+       {"id": "single_repo", "label": "Single repo (treat root as one codebase)", "route": "scan_repo", "hint": "The nested .git directories are unrelated; only the root matters for this scan."}
+     ]
+   }
+   ```
+
+2. **Obey the hint — Phase 2.5.** Paint the prompt into chat
+   verbatim (do not call any scan tool, do not read READMEs):
+
+   > Root has a .git directory AND one or more children also have
+   > .git. This could be (a) a workspace of independent repos that
+   > someone put under its own meta-repo, (b) a monorepo where the
+   > nested .git dirs are submodules / vendored checkouts, or (c)
+   > a single repo whose subdirs happen to be unrelated git
+   > checkouts. Which best describes this path?
+   >
+   > (a) **Workspace of independent repos** — Each child is its own
+   >     git repo with its own remote and release cycle. Launch the
+   >     live dashboard.
+   > (b) **Monorepo** — One coherent project; the nested .git
+   >     directories are submodules / vendored checkouts. Scan the
+   >     root as one repo.
+   > (c) **Single repo (treat root as one codebase)** — The nested
+   >     .git directories are unrelated; only the root matters.
+
+3. User picks (a). Chain the option's `route`
+   (`scan_workspace_async`) and continue from step 3 of example A.
+
 (For the rare CI / headless case where the user opts out of the
-dashboard, Phase 3c uses `check_workspace_readiness` and reports
-the same envelope synchronously — at the cost of ~5+ minutes of
-blocked chat for this 17-repo workspace.)
+dashboard, Phase 3c uses `check_workspace_readiness` and reports the
+same envelope synchronously — at the cost of ~5+ minutes of blocked
+chat for this 17-repo workspace.)
