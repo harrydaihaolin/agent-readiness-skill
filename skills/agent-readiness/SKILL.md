@@ -1,15 +1,19 @@
 ---
 name: agent-readiness
 description: >-
-  Score how agent-ready a code repository or multi-repo workspace is, and
-  apply the single highest-priority deterministic fix. Wraps the
+  Score how agent-ready a code repository or multi-repo workspace is,
+  and apply the single highest-priority deterministic fix. Wraps the
   agent-readiness-mcp server. Use when the user asks "is this repo
   agent-ready?", "score this repo / workspace", "what should I add to
   AGENTS.md?", or "fix the top agent-readiness gap". Always call
   `enumerate_workspace` first on the user-supplied path — without that
   step scoring a parent directory of N sibling repos silently produces
   garbage numbers. The Coordination pillar (workspace-only) measures
-  whether agents can operate coherently across a group of repos.
+  whether agents can operate coherently across a group of repos. The
+  skill operates in two modes: **chat mode** for single repos /
+  monorepos and **dashboard mode** for multi-repo workspaces, where
+  per-repo scans stream live to a browser dashboard and interactive
+  prompts are answered inline instead of blocking the chat.
 ---
 
 # agent-readiness skill
@@ -21,14 +25,43 @@ The skill works in three phases:
 2. **Classify** — read the enumeration (plus 2–3 READMEs if needed) and
    decide whether `path` is a single repo, a monorepo, a workspace of
    independents, or not a code repo at all.
-3. **Scan** — route to either `scan_repo(path)` (single repo / monorepo)
-   or `check_workspace_readiness(path, children_paths)` (workspace).
+3. **Scan** — route to either `scan_repo(path)` (single repo / monorepo),
+   `check_workspace_readiness(path, children_paths)` (workspace, in
+   chat mode), or `scan_workspace_async(path, children_paths)`
+   (workspace, in dashboard mode).
 
 The Coordination pillar (workspace-only) asks whether agents can
 operate coherently across a group of repos — root AGENTS.md present,
 member repos declared, dependency / change order documented. Per the
 agentic-engineering literature (Mabl, Bishoy Labib), dep-graph drift
 is the single most critical failure mode for multi-repo agent work.
+
+## Choosing a mode (read this FIRST)
+
+After Phase 2 classification, decide between two interaction modes:
+
+| Classification          | Default mode      | Why                                                                  |
+|-------------------------|-------------------|----------------------------------------------------------------------|
+| single repo / monorepo  | **chat mode**     | One repo finishes in seconds; the dashboard is overkill.             |
+| workspace (≥ 2 repos)   | **dashboard mode** | Per-repo scans run in parallel; the user sees live progress and can answer interactive prompts inline instead of blocking the chat for minutes. |
+
+**Auto-force the dashboard for multi-repo workspaces.** Per
+[the dashboard-mode design spec](https://github.com/harrydaihaolin/agent-readiness-research/blob/main/docs/superpowers/specs/2026-05-26-dashboard-mode-design.md#5-mode-entry-and-exit)
+the skill MUST auto-launch dashboard mode for any path classified as
+"workspace of independents" or multi-repo. Single-repo and monorepo
+flows stay in chat mode.
+
+**Always tell the user how to exit dashboard mode.** Either channel works:
+
+- *In chat:* user types `/agent-readiness exit-dashboard` (or just
+  asks to "exit dashboard mode") — you call `get_scan_status` to
+  observe the next state and switch back to chat mode.
+- *In dashboard:* user clicks the "Exit dashboard mode" button — the
+  scan keeps running in the background, the dashboard server stays
+  up until its idle timeout, and your next chat-side action observes
+  `mode_exit_requested: true` on `get_scan_status` and reverts.
+
+The scan is the same scan in either mode; only the surface changes.
 
 ## Workflow
 
@@ -57,7 +90,7 @@ Apply this rubric in order:
 | Root has neither `.git` nor `README.md` AND enumeration returned zero children               | **not a code repo**           | Tell the user, exit                                                                                                                    |
 | Anything else                                                                                | **ambiguous**                 | Read root + 2–3 child READMEs via the Read tool; ask the user if still unclear                                                         |
 
-### Phase 3a — Scan a single repo / monorepo
+### Phase 3a — Chat mode — single repo / monorepo
 
 ```
 result = scan_repo(path="/path/to/repo")
@@ -68,7 +101,11 @@ print(result["top_action"])
 The `top_action` block contains `action` (a structured edit) and
 `verify` (a one-line shell command).
 
-### Phase 3b — Scan a workspace
+### Phase 3b — Chat mode — workspace (fallback)
+
+Use `check_workspace_readiness` only when **the user explicitly opted
+out of dashboard mode**. Otherwise prefer Phase 3c (dashboard mode),
+which is the default for multi-repo workspaces.
 
 ```
 result = check_workspace_readiness(
@@ -89,6 +126,81 @@ Present:
 - Children sorted worst-first, each with overall score + safety cap if any.
 - The `top_action` with its `scope` called out.
 - The verify command, so the user can confirm the fix.
+
+### Phase 3c — Dashboard mode — workspace (default)
+
+Use this for any multi-repo workspace, monorepo with many sub-repos,
+or any path where you'd otherwise block the chat for >30s waiting on
+sequential scans. The dashboard surfaces per-repo progress live and
+lets the user answer interactive prompts inline.
+
+```
+session = scan_workspace_async(
+    path="/path/to/workspace",
+    children_paths=[<paths Claude classified as workspace members>],
+)
+# session contains: scan_id, dashboard_url, sse_url, snapshot_url
+```
+
+Then **tell the user where the dashboard is**:
+
+- Print `session["dashboard_url"]` so they can open it in a browser.
+  The bundled scan-and-view server hosts the SPA at
+  `http://localhost:<port>/live/<scan_id>` (the URL above already
+  points at it).
+- Tell them they can **exit dashboard mode anytime** by typing
+  `/agent-readiness exit-dashboard` here in the chat OR by clicking
+  the "Exit dashboard mode" button in the browser. Either channel
+  returns control to chat mode without killing the scan.
+- Hand off — do NOT block the chat tailing the SSE stream. The skill
+  bridge is **hands-off** by design (see spec § 4): you only check
+  status when the user types in chat.
+
+#### Status polling during dashboard mode
+
+Each time the user sends a chat message while dashboard mode is
+active, call `get_scan_status(scan_id)` once and respond conversationally
+based on what comes back. The status envelope (enriched in
+agent-readiness-mcp v0.7.0) carries:
+
+| Field                    | What to do with it                                                   |
+|--------------------------|----------------------------------------------------------------------|
+| `status`                 | If `completed`, summarise and offer apply. If `running`, keep brief. |
+| `progress.completed/total` | One-liner: "X of Y repos done".                                    |
+| `overall_score`          | Render only when `status == completed`.                              |
+| `sse_url`                | Recover the dashboard URL from this if the user lost the tab.        |
+| `prompts_pending_count`  | If > 0, **tell the user to answer the prompts in the dashboard**.    |
+| `mode_exit_requested`    | If `true`, switch back to chat mode (the user clicked Exit).         |
+
+Never call `get_scan_status` in a loop. One call per chat turn — the
+skill bridge is hands-off, not a live tail.
+
+#### Mid-scan interactive prompts
+
+The scanner asks up to six kinds of clarifying question during a scan
+(classify / members / umbrella / topaction / ratify / clarify). In
+dashboard mode the user answers them inline by clicking buttons in the
+PromptsQueue — you do NOT need to relay the question into chat. If
+`prompts_pending_count > 0` is reported and stays > 0 across several
+turns, gently nudge the user to switch to the browser tab.
+
+If the user explicitly asks for a question to be answered in chat
+("just tell me what it's asking"), read it from
+`fetch <snapshot_url>` (or shell out to the dashboard's POST endpoint
+to submit on their behalf).
+
+#### Exit dashboard mode in chat
+
+When the user asks to exit dashboard mode:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"source": "chat"}' \
+  <session["dashboard_url"]>/api/scans/<scan_id>/exit
+```
+
+The scan keeps running. Tell the user the dashboard tab is still
+useful for watching progress; chat mode is back.
 
 ## Bootstrap an ontology
 
