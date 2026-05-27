@@ -1,7 +1,7 @@
 {
   "name": "agent-readiness",
   "description": "Score how AI-ready a code repository or multi-repo workspace is and apply the single highest-priority deterministic fix via the agent-readiness-mcp server. Supports chat mode (single repo) and dashboard mode (multi-repo, live SSE + interactive prompts).",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": { "name": "Harry Dai" },
   "homepage": "https://github.com/harrydaihaolin/agent-readiness",
   "repository": "https://github.com/harrydaihaolin/agent-readiness-skill",
