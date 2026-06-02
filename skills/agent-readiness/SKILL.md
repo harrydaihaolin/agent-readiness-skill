@@ -124,6 +124,39 @@ Read the status envelope:
 | `prompts_pending_count`  | If > 0, tell the user to answer prompts in the dashboard tab.         |
 | `mode_exit_requested`    | If `true`, switch back to chat mode (user clicked Exit).              |
 
+### Phase 4 — Watch mode (`/agent-readiness watch`)
+
+The dashboard's **Start a new scan** and **Stop** buttons can't call MCP
+tools directly, so they write *intents* to a local queue. **Watch mode** is
+how those buttons become real scans: the user runs `/agent-readiness watch`
+and you run a self-paced `/loop` that drains the queue.
+
+**Only enter watch mode when the user explicitly runs `/agent-readiness
+watch`.** It is never automatic — an active loop consumes tokens
+continuously while it runs. Say so when you start: *"Watch mode is on; it
+polls every ~20s and uses tokens while active. Run `/agent-readiness
+unwatch` to stop."*
+
+Each loop tick:
+
+1. `get_pending_intents_tool()` — list queued intents.
+2. For each intent, `claim_intent_tool(intent_id)`. If `ok` is `false`, skip
+   it (another tick already owns it).
+3. Dispatch the claimed intent:
+   - **`start`** → `inspect_tool(path)`, then the classified
+     `scan_<type>_tool(path)`, then
+     `ack_intent_tool(id, "done", {"dashboard_url": <url>})`. (This opens the
+     onboarding wizard as usual — the user still picks repos and clicks Start
+     there. The button replaced "copy a terminal command," not the wizard.)
+   - **`stop`** → `stop_scan_tool(scan_id)`, then
+     `ack_intent_tool(id, "done")`.
+   - On any error → `ack_intent_tool(id, "failed", {"error": <message>})`.
+4. Re-arm the loop (~20s cadence).
+
+**Stop conditions:** the user runs `/agent-readiness unwatch`, or ~20
+consecutive idle ticks (no pending intents) elapse — then exit the loop and
+tell the user watch mode ended.
+
 ## Tool reference
 
 | Tool                          | When                                                              |
@@ -136,6 +169,9 @@ Read the status envelope:
 | `stop_scan_tool`              | When the user asks to cancel.                                     |
 | `apply_top_action_tool`       | After scan completes, when user accepts the fix.                  |
 | `list_friction_tool`          | When user wants to see all WARN/ERROR findings.                   |
+| `get_pending_intents_tool`    | Watch mode only. List queued dashboard intents each loop tick.    |
+| `claim_intent_tool`           | Watch mode only. Claim a pending intent before executing it.      |
+| `ack_intent_tool`             | Watch mode only. Mark an intent done/failed after executing it.   |
 
 ### Tools you should NOT call from a fresh user request
 
