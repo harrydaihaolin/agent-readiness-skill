@@ -1,7 +1,7 @@
 {
   "name": "agent-readiness",
-  "description": "Score how AI-ready a code repository, monorepo, or multi-repo workspace is and apply the single highest-priority deterministic fix via the agent-readiness-mcp server (>=0.8.0). Always calls inspect_tool first, then exactly one of scan_repo_tool / scan_monorepo_tool / scan_workspace_tool. Each scan opens an onboarding wizard so the user confirms type and picks repos before any scanning starts.",
-  "version": "0.3.0",
+  "description": "Score how AI-ready a code repository, monorepo, or multi-repo workspace is and surface the fixes as paste-ready prompts — entirely in chat, no browser or dashboard. Wraps the headless agent-readiness-mcp server (>=0.9.0). Always calls inspect_tool first, then exactly one headless scan tool (scan_repo_tool / scan_monorepo_tool / scan_workspace_tool(path, children)) which returns the readiness report inline. Presents the score plus the engine's generated fix_prompts, leading with the workspace Coordination prompts.",
+  "version": "0.4.0",
   "author": { "name": "Harry Dai" },
   "homepage": "https://github.com/harrydaihaolin/agent-readiness",
   "repository": "https://github.com/harrydaihaolin/agent-readiness-skill",

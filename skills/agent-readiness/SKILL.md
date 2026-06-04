@@ -1,51 +1,45 @@
 ---
 name: agent-readiness
 description: >-
-  Score how agent-ready a code repository or multi-repo workspace is,
-  and apply the single highest-priority deterministic fix. Wraps the
-  agent-readiness-mcp server (>= 0.8.0). Use when the user asks "is
-  this repo agent-ready?", "score this repo / workspace", "what should
-  I add to AGENTS.md?", or "fix the top agent-readiness gap". The
-  first tool call on any user-supplied path is always
-  **`inspect_tool(path)`** — it returns the suggested workspace type
-  in ~200ms with zero deliberation on your side. Then call exactly
-  ONE of: `scan_repo_tool(path)` (single_repo), `scan_monorepo_tool(path)`
-  (monorepo), `scan_workspace_tool(path)` (workspace). Each opens an
-  onboarding wizard in the browser at `/#/onboarding/<scan_id>`. The
-  user confirms the type and picks which repos to scan before any
-  scanning starts — so there's no "wait several minutes only to discover
-  we scanned the wrong thing" failure mode. Single repos, monorepos,
-  and workspaces all flow through the same dashboard surface; the
-  wizard adapts its step strip based on the type. The Coordination
-  pillar (workspace-only) measures whether agents can operate
-  coherently across a group of repos.
+  Score how agent-ready a code repository, monorepo, or multi-repo
+  workspace is, and surface the fixes as paste-ready prompts — entirely
+  in chat, no browser or dashboard. Wraps the agent-readiness-mcp
+  server (>= 0.9.0). Use when the user asks "is this repo agent-ready?",
+  "score this repo / workspace", "what should I add to AGENTS.md?", or
+  "fix the top agent-readiness gap". The first tool call on any
+  user-supplied path is always **`inspect_tool(path)`** — it returns the
+  suggested workspace type in ~200ms with zero deliberation on your
+  side. Then call exactly ONE headless scan tool, which returns the
+  readiness report inline: `scan_repo_tool(path)` (single_repo),
+  `scan_monorepo_tool(path)` (monorepo), or
+  `scan_workspace_tool(path, children)` (workspace, where children is
+  the list of `.git` repo paths from inspect). Present the score plus
+  the engine's generated `fix_prompt`s in chat — for a workspace the
+  headline output is the Coordination prompts. Offer to apply the top
+  fix (`apply_top_action_tool`) or to write a root `AGENTS.md`. The
+  Coordination pillar (workspace-only) measures whether agents can
+  operate coherently across a group of repos.
 ---
 
 # agent-readiness skill
 
-Score how agent-ready a code repository, monorepo, or multi-repo workspace is.
+Score how agent-ready a code repository, monorepo, or multi-repo
+workspace is — and generate the fixes as paste-ready prompts. This
+skill is **prompt-only**: everything happens in chat. There is no
+browser, no dashboard, and no background scan to babysit.
 
 ## The contract
 
-**Two tool calls. No more, no less, on a fresh user request.**
+**Two tool calls on a fresh user request: classify, then scan.**
 
 1. `inspect_tool(path)` — returns `{enumeration, classification}` in ~200ms.
-2. Exactly ONE of `scan_repo_tool` / `scan_monorepo_tool` / `scan_workspace_tool`, picked by `inspect`'s `classification.suggested_type`.
-
-The scan tool opens an onboarding wizard at
-`/#/onboarding/<scan_id>`. The wizard's pages let the user **confirm
-the type and pick which repos to include before any scanning starts**
-— so you can't accidentally spend 5 minutes scanning a 200-package
-umbrella when the user wanted just 3 repos. After the user clicks
-Start in the browser, the live dashboard takes over with a grid of
-per-repo cards animated by a green water-flow progress bar.
+2. Exactly ONE headless scan tool, picked by `classification.suggested_type`.
+   Each returns the readiness report **inline** — you read it and respond.
 
 **You make ZERO classification decisions.** The classifier is a
-deterministic five-branch counting rubric in
-``agent-readiness/src/agent_readiness/enumerate_git.py``. If you find
-yourself thinking "but maybe this monorepo is actually a workspace
-because…" — stop. Trust the classifier and call the corresponding
-tool. The user can override in the wizard.
+deterministic rubric in the engine. If you find yourself thinking "but
+maybe this monorepo is actually a workspace because…" — stop. Trust
+`suggested_type` and call the matching tool.
 
 ## Workflow
 
@@ -62,7 +56,7 @@ Returns:
   "enumeration": {
     "root": "...",
     "root_has_git": true | false,
-    "repos": [ {RepoCandidate}, ... ],
+    "repos": [ { "path": "...", "has_git": true }, ... ],
     "directories_walked": 142,
     "elapsed_ms": 64
   },
@@ -79,123 +73,80 @@ If `inspect_tool` returns `{"status": "error"}` (bad path, etc.), surface the
 
 ### Phase 2 — Dispatch on `classification.suggested_type`
 
-| `suggested_type`   | Call                                  | What opens                                              |
-|--------------------|---------------------------------------|---------------------------------------------------------|
-| `"single_repo"`    | `scan_repo_tool(path)`                | 2-step wizard (Detected → Start), one-card live view.    |
-| `"monorepo"`       | `scan_monorepo_tool(path)`            | 3-step wizard with grouped-by-folder picker, grid view.  |
-| `"workspace"`      | `scan_workspace_tool(path)`           | 3-step wizard with flat picker grid, grid view.          |
+| `suggested_type`   | Call                                              | Returns                                  |
+|--------------------|---------------------------------------------------|------------------------------------------|
+| `"single_repo"`    | `scan_repo_tool(path)`                            | `ReadinessReport` (one repo)             |
+| `"monorepo"`       | `scan_monorepo_tool(path)`                        | `ReadinessReport` (root scored as one)   |
+| `"workspace"`      | `scan_workspace_tool(path, children=[...])`       | `WorkspaceReadinessReport` (incl. Coordination) |
 
-The scan tool returns:
+For a workspace, build `children` from the inspect enumeration: the
+list of `repos[*].path` entries that have `.git`. Pass them explicitly —
+the tool trusts your selection and does not re-enumerate.
 
-```json
-{
-  "status": "onboarding_required",
-  "scan_id": "demo-b8e52a",
-  "dashboard_url": "http://127.0.0.1:57906/#/onboarding/demo-b8e52a",
-  "type": "workspace",
-  "message": "Onboarding wizard opened. Pick repos and confirm to start scan."
-}
-```
+Each scan runs synchronously and returns the report inline. There is no
+`dashboard_url` to print and nothing to hand off — read the report and
+move to Phase 3.
 
-**Print `dashboard_url` verbatim to the user in your very next response, then stop calling tools.** Example response:
+### Phase 3 — Present the score and generate fix-prompts
 
-> I opened the onboarding wizard at http://127.0.0.1:57906/#/onboarding/demo-b8e52a.
-> Pick which repos you want included and click Start when you're ready.
-> The dashboard will then show live progress with per-repo scoring.
->
-> To exit dashboard mode without killing the scan: click "Exit dashboard
-> mode" in the browser, or type `/agent-readiness exit-dashboard` in chat.
+This is the whole point of the skill: turn the report into paste-ready
+prompts the user (or another agent) can act on.
 
-### Phase 3 — Status polling (optional)
+**Single repo / monorepo:**
 
-Once the user clicks Start in the browser, the scan runs in the
-background. **The skill is hands-off by design** — the dashboard owns
-the UX. Per chat turn, you may call `get_scan_status_tool(scan_id)`
-**at most once**, and only when the user asks "how's it going?" / "is
-it done?". Never poll in a loop.
+1. State the overall score and the per-pillar scores.
+2. Call `list_friction_tool(path)` — it returns every WARN/ERROR finding
+   with a paste-ready `fix_prompt`, sorted by `score_impact`. Present the
+   top few as prompts, each with its `verify` command.
+3. Offer to apply the single highest-impact fix with
+   `apply_top_action_tool(path)`.
 
-Read the status envelope:
+**Workspace:**
 
-| Field                    | What to do                                                            |
-|--------------------------|------------------------------------------------------------------------|
-| `status: "completed"`    | Summarise + offer `apply_top_action_tool`.                            |
-| `status: "running"`      | One-liner: "X of Y repos done."                                       |
-| `progress.completed/total` | "X of Y repos done."                                                 |
-| `prompts_pending_count`  | If > 0, tell the user to answer prompts in the dashboard tab.         |
-| `mode_exit_requested`    | If `true`, switch back to chat mode (user clicked Exit).              |
+1. State the overall score + every per-pillar score in the report
+   (Cognitive Load, Feedback, Flow, Safety, and the workspace-only
+   **Coordination** pillar; some engine versions also report Ontology).
+2. List the children worst-first with their scores.
+3. Surface the report's `top_action`. If it carries a `fix_prompt` —
+   for a workspace this is usually the **Coordination** prompt (e.g.
+   "add a root `AGENTS.md` declaring member repos and dependency
+   order") — present it with its `verify`. If `top_action` has no
+   `fix_prompt`, present its `message`/`action` instead.
+4. Offer to write the root `AGENTS.md` yourself, or to drill into the
+   worst child with `scan_repo_tool` + `list_friction_tool`.
 
-### Phase 4 — Watch mode (`/agent-readiness watch`)
-
-The dashboard's **Start a new scan** and **Stop** buttons can't call MCP
-tools directly, so they write *intents* to a local queue. **Watch mode** is
-how those buttons become real scans: the user runs `/agent-readiness watch`
-and you run a self-paced `/loop` that drains the queue.
-
-**Only enter watch mode when the user explicitly runs `/agent-readiness
-watch`.** It is never automatic — an active loop consumes tokens
-continuously while it runs. Say so when you start: *"Watch mode is on; it
-polls every ~20s and uses tokens while active. Run `/agent-readiness
-unwatch` to stop."*
-
-Each loop tick:
-
-1. `get_pending_intents_tool()` — list queued intents.
-2. For each intent, `claim_intent_tool(intent_id)`. If `ok` is `false`, skip
-   it (another tick already owns it).
-3. Dispatch the claimed intent:
-   - **`start`** → `inspect_tool(path)`, then the classified
-     `scan_<type>_tool(path)`, then
-     `ack_intent_tool(id, "done", {"dashboard_url": <url>})`. (This opens the
-     onboarding wizard as usual — the user still picks repos and clicks Start
-     there. The button replaced "copy a terminal command," not the wizard.)
-   - **`stop`** → `stop_scan_tool(scan_id)`, then
-     `ack_intent_tool(id, "done")`.
-   - On any error → `ack_intent_tool(id, "failed", {"error": <message>})`.
-4. Re-arm the loop (~20s cadence).
-
-**Stop conditions:** the user runs `/agent-readiness unwatch`, or ~20
-consecutive idle ticks (no pending intents) elapse — then exit the loop and
-tell the user watch mode ended.
+Never invent scores or prompts. Everything you present comes from the
+report or `list_friction_tool`.
 
 ## Tool reference
 
 | Tool                          | When                                                              |
 |-------------------------------|-------------------------------------------------------------------|
 | `inspect_tool`                | Always first. ~200ms. Returns enumeration + classification.       |
-| `scan_repo_tool`              | When `suggested_type == "single_repo"`.                           |
-| `scan_monorepo_tool`          | When `suggested_type == "monorepo"`.                              |
-| `scan_workspace_tool`         | When `suggested_type == "workspace"`.                             |
-| `get_scan_status_tool`        | Phase 3 only. ≤1 call per chat turn. Never poll in a loop.        |
-| `stop_scan_tool`              | When the user asks to cancel.                                     |
-| `apply_top_action_tool`       | After scan completes, when user accepts the fix.                  |
-| `list_friction_tool`          | When user wants to see all WARN/ERROR findings.                   |
-| `get_pending_intents_tool`    | Watch mode only. List queued dashboard intents each loop tick.    |
-| `claim_intent_tool`           | Watch mode only. Claim a pending intent before executing it.      |
-| `ack_intent_tool`             | Watch mode only. Mark an intent done/failed after executing it.   |
+| `scan_repo_tool`              | When `suggested_type == "single_repo"`. Returns report inline.    |
+| `scan_monorepo_tool`          | When `suggested_type == "monorepo"`. Returns report inline.       |
+| `scan_workspace_tool`         | When `suggested_type == "workspace"`. Pass `children=[...]`.       |
+| `list_friction_tool`          | Phase 3: every WARN/ERROR finding with a paste-ready `fix_prompt`. |
+| `apply_top_action_tool`       | When the user accepts the top fix.                                 |
 
-### Tools you should NOT call from a fresh user request
-
-- `scan_and_view_tool` — **removed in MCP 0.8.0**. Calling it errors.
-- `detect_workspace_tool`, `enumerate_workspace_tool` — legacy depth-1
-  classifiers from before the typed-tool refactor. The new
-  `inspect_tool` supersedes both with smarter git-aware enumeration.
-- `check_workspace_readiness_tool` — synchronous blocking workspace
-  scan. Avoid for any workspace ≥ 2 repos.
+There is no dashboard tool. The MCP server is headless and prompt-only;
+do not look for a `scan_workspace_async_tool`, `get_scan_status_tool`,
+or any `dashboard_url` — they were removed in MCP 0.9.0.
 
 ## The Coordination pillar (workspace-only)
 
-Multi-repo workspaces score on four pillars + a fifth: **Coordination**.
-Asks whether agents can operate coherently across a group of repos:
+Multi-repo workspaces add a **Coordination** pillar on top of the
+per-repo pillars. It asks whether agents can operate coherently across
+a group of repos:
 
 - Is there a root `AGENTS.md` declaring member repos and boundaries?
 - Are dependency-update orders documented?
 - Are coupling pairs annotated (so changing one ratchets the other)?
 
-The Coordination pillar is the single most critical failure mode for
-multi-repo agent work per the agentic-engineering literature
-(Mabl 2024 "AI agents across services", Bishoy Labib "Coordination
-gaps in multi-repo dev environments"). Workspace scans surface
-Coordination findings prominently in the dashboard's left column.
+Coordination is the single most critical failure mode for multi-repo
+agent work per the agentic-engineering literature (Mabl 2024 "AI agents
+across services", Bishoy Labib "Coordination gaps in multi-repo dev
+environments"). Lead with its `fix_prompt` when presenting a workspace.
 
 ## Quick examples
 
@@ -206,30 +157,40 @@ inspect_tool(path="/home/user/code/llm-eval")
 # → {classification: {suggested_type: "single_repo", confidence: "high"}}
 
 scan_repo_tool(path="/home/user/code/llm-eval")
-# → {status: "onboarding_required", dashboard_url: "http://.../#/onboarding/llm-eval-abc123"}
+# → {overall_score: 72.0, pillars: [...], top_action: {...}}
+
+list_friction_tool(path="/home/user/code/llm-eval")
+# → [{rule_id, severity, message, fix_prompt, verify, score_impact}, ...]
 ```
 
-Response to user: "I opened the wizard at http://.../#/onboarding/llm-eval-abc123. Confirm and click Start."
+Response: "Overall 72/100. Top gaps and paste-ready fixes: …" then offer
+`apply_top_action_tool`.
 
 **User: "is ~/mle agent-ready?"** (a folder containing 7 nested git projects)
 
 ```
 inspect_tool(path="/home/user/mle")
 # → {classification: {suggested_type: "workspace", confidence: "medium",
-#                     rationale: "Root has no .git, 7 nested .git."}}
+#                     rationale: "Root has no .git, 7 nested .git."},
+#    enumeration: {repos: [{path: ".../r1", has_git: true}, ...]}}
 
-scan_workspace_tool(path="/home/user/mle")
-# → {status: "onboarding_required", dashboard_url: "...", type: "workspace"}
+scan_workspace_tool(
+    path="/home/user/mle",
+    children=["/home/user/mle/r1", ".../r2", ".../r3", ...],
+)
+# → {overall_score, pillars: [..., {pillar: "coordination", ...}],
+#    children: [...], top_action: {fix_prompt: "...", verify: "..."}}
 ```
 
-Response to user: "I opened the wizard at ... — pick which of the 7 repos you want included."
+Response: lead with the 5 pillar scores, then the Coordination
+`fix_prompt`; offer to write the root `AGENTS.md`.
 
 **User: "score this monorepo"** (root has `.git`, two packages inside)
 
 ```
 inspect_tool(path=".")
-# → {classification: {suggested_type: "monorepo", confidence: "medium"}}
+# → {classification: {suggested_type: "monorepo"}}
 
 scan_monorepo_tool(path=".")
-# → {status: "onboarding_required", dashboard_url: "..."}
+# → {overall_score, pillars, top_action}
 ```
